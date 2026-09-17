@@ -383,6 +383,7 @@ func startBindingController(ctx controllerscontext.Context) (enabled bool, err e
 	}
 	bindingController := &binding.ResourceBindingController{
 		Client:              ctx.Mgr.GetClient(),
+		APIReader:           ctx.Mgr.GetAPIReader(),
 		DynamicClient:       ctx.DynamicClientSet,
 		EventRecorder:       ctx.Mgr.GetEventRecorderFor(binding.ControllerName), //nolint:staticcheck // Note: GetEventRecorderFor is deprecated in controller-runtime v0.23.0 in favor of GetEventRecorder. This changes event API from v1 events to events.k8s.io. We need to migrate carefully, especially considering the impact on users and RBAC permission changes in installation/deployment tools.
 		RESTMapper:          ctx.Mgr.GetRESTMapper(),
@@ -401,6 +402,7 @@ func startBindingController(ctx controllerscontext.Context) (enabled bool, err e
 	}
 	clusterResourceBindingController := &binding.ClusterResourceBindingController{
 		Client:              ctx.Mgr.GetClient(),
+		APIReader:           ctx.Mgr.GetAPIReader(),
 		DynamicClient:       ctx.DynamicClientSet,
 		EventRecorder:       ctx.Mgr.GetEventRecorderFor(binding.ClusterResourceBindingControllerName), //nolint:staticcheck // Note: GetEventRecorderFor is deprecated in controller-runtime v0.23.0 in favor of GetEventRecorder. This changes event API from v1 events to events.k8s.io. We need to migrate carefully, especially considering the impact on users and RBAC permission changes in installation/deployment tools.
 		RESTMapper:          ctx.Mgr.GetRESTMapper(),

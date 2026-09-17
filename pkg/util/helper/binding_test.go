@@ -1335,10 +1335,12 @@ func TestFetchWorkloadByLabelSelector(t *testing.T) {
 
 func TestDeleteWorkByRBNamespaceAndName(t *testing.T) {
 	type args struct {
-		c         client.Client
-		namespace string
-		name      string
-		bindingID string
+		c                 client.Client
+		apiReader         client.Reader
+		namespace         string
+		name              string
+		bindingID         string
+		scheduledClusters sets.Set[string]
 	}
 	tests := []struct {
 		name    string
@@ -1390,6 +1392,50 @@ func TestDeleteWorkByRBNamespaceAndName(t *testing.T) {
 			wantErr: false,
 		},
 		{
+			name: "delete rb's work the cache has not indexed yet",
+			args: args{
+				c:                 staleIndexClient{Client: deleteWorksFixture()},
+				apiReader:         deleteWorksFixtureReader(),
+				namespace:         "default",
+				name:              "foo",
+				bindingID:         "3617252f-b1bb-43b0-98a1-c7de833c472c",
+				scheduledClusters: sets.New("cluster1", "cluster2"),
+			},
+			want:    []workv1alpha1.Work{},
+			wantErr: false,
+		},
+		{
+			name: "delete rb's work the cache has only partly indexed",
+			args: args{
+				c: staleIndexClient{
+					Client:            deleteWorksFixture(),
+					visibleNamespaces: sets.New(names.ExecutionSpacePrefix + "cluster1"),
+				},
+				apiReader:         deleteWorksFixtureReader(),
+				namespace:         "default",
+				name:              "foo",
+				bindingID:         "3617252f-b1bb-43b0-98a1-c7de833c472c",
+				scheduledClusters: sets.New("cluster1", "cluster2"),
+			},
+			want:    []workv1alpha1.Work{},
+			wantErr: false,
+		},
+		{
+			name: "delete an unscheduled rb's work the cache has only partly indexed",
+			args: args{
+				c: staleIndexClient{
+					Client:            deleteWorksFixture(),
+					visibleNamespaces: sets.New(names.ExecutionSpacePrefix + "cluster1"),
+				},
+				apiReader: deleteWorksFixtureReader(),
+				namespace: "default",
+				name:      "foo",
+				bindingID: "3617252f-b1bb-43b0-98a1-c7de833c472c",
+			},
+			want:    []workv1alpha1.Work{},
+			wantErr: false,
+		},
+		{
 			name: "delete crb's work",
 			args: args{
 				c: fake.NewClientBuilder().WithScheme(gclient.NewSchema()).WithObjects(
@@ -1418,7 +1464,11 @@ func TestDeleteWorkByRBNamespaceAndName(t *testing.T) {
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			if err := DeleteWorks(context.Background(), tt.args.c, tt.args.namespace, tt.args.name, tt.args.bindingID); (err != nil) != tt.wantErr {
+			apiReader := tt.args.apiReader
+			if apiReader == nil {
+				apiReader = tt.args.c
+			}
+			if err := DeleteWorks(context.Background(), tt.args.c, apiReader, tt.args.namespace, tt.args.name, tt.args.bindingID, tt.args.scheduledClusters); (err != nil) != tt.wantErr {
 				t.Errorf("DeleteWorks() error = %v, wantErr %v", err, tt.wantErr)
 			}
 			list := &workv1alpha1.WorkList{}
@@ -2171,6 +2221,117 @@ func TestGenerateNodeClaimByPodSpec(t *testing.T) {
 			got := GenerateNodeClaimByPodSpec(tt.podSpec)
 			if !reflect.DeepEqual(got, tt.expected) {
 				t.Errorf("GenerateNodeClaimByPodSpec() = %+v, want %+v", got, tt.expected)
+			}
+		})
+	}
+}
+
+// staleIndexClient serves an indexed List from a cache that trails the API server, which
+// is the condition that strands Works when a binding is deleted. Only the Works whose
+// execution namespace appears in visibleNamespaces come back, standing in for the watch
+// events that have not arrived yet, and a nil set returns nothing at all. Every other call
+// is delegated, so a Work deleted through it really is deleted.
+type staleIndexClient struct {
+	client.Client
+	visibleNamespaces sets.Set[string]
+}
+
+func (s staleIndexClient) List(ctx context.Context, list client.ObjectList, opts ...client.ListOption) error {
+	listOpts := &client.ListOptions{}
+	for _, opt := range opts {
+		opt.ApplyToList(listOpts)
+	}
+	if err := s.Client.List(ctx, list, opts...); err != nil {
+		return err
+	}
+	if listOpts.FieldSelector == nil {
+		return nil
+	}
+	workList, ok := list.(*workv1alpha1.WorkList)
+	if !ok {
+		return nil
+	}
+	visible := make([]workv1alpha1.Work, 0, len(workList.Items))
+	for _, work := range workList.Items {
+		if s.visibleNamespaces.Has(work.Namespace) {
+			visible = append(visible, work)
+		}
+	}
+	workList.Items = visible
+	return nil
+}
+
+func deleteWorksFixture() client.Client {
+	return fake.NewClientBuilder().WithScheme(gclient.NewSchema()).WithObjects(
+		&workv1alpha1.Work{
+			ObjectMeta: metav1.ObjectMeta{
+				Name: "w1", Namespace: names.ExecutionSpacePrefix + "cluster1",
+				Labels: map[string]string{
+					workv1alpha2.ResourceBindingPermanentIDLabel: "3617252f-b1bb-43b0-98a1-c7de833c472c",
+				},
+			},
+		},
+		&workv1alpha1.Work{
+			ObjectMeta: metav1.ObjectMeta{
+				Name: "w2", Namespace: names.ExecutionSpacePrefix + "cluster2",
+				Labels: map[string]string{
+					workv1alpha2.ResourceBindingPermanentIDLabel: "3617252f-b1bb-43b0-98a1-c7de833c472c",
+				},
+			},
+		},
+	).WithIndex(
+		&workv1alpha1.Work{},
+		indexregistry.WorkIndexByLabelResourceBindingID,
+		indexregistry.GenLabelIndexerFunc(workv1alpha2.ResourceBindingPermanentIDLabel),
+	).Build()
+}
+
+func deleteWorksFixtureReader() client.Reader {
+	return deleteWorksFixture()
+}
+
+func TestClustersThatMayHoldWorks(t *testing.T) {
+	tests := []struct {
+		name   string
+		spec   workv1alpha2.ResourceBindingSpec
+		status workv1alpha2.ResourceBindingStatus
+		want   sets.Set[string]
+	}{
+		{
+			name: "scheduled clusters",
+			spec: workv1alpha2.ResourceBindingSpec{
+				Clusters: []workv1alpha2.TargetCluster{{Name: "cluster1"}, {Name: "cluster2"}},
+			},
+			want: sets.New("cluster1", "cluster2"),
+		},
+		{
+			name: "a cluster evicted with PurgeMode Directly still holds a work",
+			spec: workv1alpha2.ResourceBindingSpec{
+				Clusters: []workv1alpha2.TargetCluster{{Name: "cluster1"}},
+				GracefulEvictionTasks: []workv1alpha2.GracefulEvictionTask{
+					{FromCluster: "cluster2", PurgeMode: policyv1alpha1.PurgeModeDirectly},
+				},
+			},
+			want: sets.New("cluster1", "cluster2"),
+		},
+		{
+			name: "a cluster the binding is no longer scheduled to still reports status",
+			spec: workv1alpha2.ResourceBindingSpec{},
+			status: workv1alpha2.ResourceBindingStatus{
+				AggregatedStatus: []workv1alpha2.AggregatedStatusItem{{ClusterName: "cluster3"}},
+			},
+			want: sets.New("cluster3"),
+		},
+		{
+			name: "a binding that was never scheduled names no cluster",
+			spec: workv1alpha2.ResourceBindingSpec{},
+			want: sets.New[string](),
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := ClustersThatMayHoldWorks(tt.spec, tt.status); !got.Equal(tt.want) {
+				t.Errorf("ClustersThatMayHoldWorks() got = %v, want %v", sets.List(got), sets.List(tt.want))
 			}
 		})
 	}
