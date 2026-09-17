@@ -402,11 +402,36 @@ func GetResourceBindingsByNamespace(c client.Client, namespace string) (*workv1a
 }
 
 // DeleteWorks will delete all Work objects by labels.
-func DeleteWorks(ctx context.Context, c client.Client, namespace, name, bindingID string) error {
+func DeleteWorks(ctx context.Context, c client.Client, apiReader client.Reader, namespace, name, bindingID string, expectedClusters sets.Set[string]) error {
 	workList, err := GetWorksByBindingID(ctx, c, bindingID, namespace != "")
 	if err != nil {
 		klog.Errorf("Failed to get works by (Cluster)ResourceBinding(%s/%s) : %v", namespace, name, err)
 		return err
+	}
+
+	// The caller removes the finalizer once this returns, and Work carries no
+	// cross-namespace ownerReference, so a Work this misses is stranded for good:
+	// garbage collection has nothing to follow, and the execution controller keeps
+	// re-applying it to the member cluster. The index behind GetWorksByBindingID is
+	// held in an informer cache that trails the API server by a watch round-trip, so
+	// a binding deleted soon after it was scheduled can read back missing some or
+	// all of its Works. Confirm against the API server whenever the cache does not
+	// account for every cluster the binding may hold a Work on, and whenever there
+	// is no such cluster to check the cache against, since a binding that has been
+	// fully evicted still reaches here with Works left to remove.
+	missing := clustersMissingWorks(workList, expectedClusters)
+	if len(missing) > 0 || expectedClusters.Len() == 0 {
+		confirmed, err := GetWorksByBindingIDFromAPIServer(ctx, apiReader, bindingID, namespace != "")
+		if err != nil {
+			klog.Errorf("Failed to confirm works by (Cluster)ResourceBinding(%s/%s) against the API server: %v", namespace, name, err)
+			return err
+		}
+		if len(confirmed.Items) > len(workList.Items) {
+			klog.V(2).InfoS("Cache reported fewer works than the API server for binding, deleting the works the cache missed",
+				"namespace", namespace, "binding", name, "cached", len(workList.Items),
+				"confirmed", len(confirmed.Items), "clustersMissingFromCache", sets.List(missing))
+		}
+		workList = confirmed
 	}
 
 	var errs []error
@@ -420,6 +445,35 @@ func DeleteWorks(ctx context.Context, c client.Client, namespace, name, bindingI
 		}
 	}
 	return errors.NewAggregate(errs)
+}
+
+// ClustersThatMayHoldWorks returns every cluster a binding may still have a Work on.
+// That is wider than the binding's scheduling result: a cluster whose eviction task
+// purges directly is excluded from ObtainBindingSpecExistingClusters and keeps its
+// Work until something removes it, and a cluster the binding has since been evicted
+// from still appears in the aggregated status.
+func ClustersThatMayHoldWorks(spec workv1alpha2.ResourceBindingSpec, status workv1alpha2.ResourceBindingStatus) sets.Set[string] {
+	clusters := ObtainBindingSpecExistingClusters(spec).Union(ObtainClustersWithPurgeModeDirectly(spec))
+	for _, item := range status.AggregatedStatus {
+		clusters.Insert(item.ClusterName)
+	}
+	return clusters
+}
+
+// clustersMissingWorks reports the expected clusters that workList holds no Work for.
+func clustersMissingWorks(workList *workv1alpha1.WorkList, expectedClusters sets.Set[string]) sets.Set[string] {
+	executionSpaces := sets.New[string]()
+	for index := range workList.Items {
+		executionSpaces.Insert(workList.Items[index].Namespace)
+	}
+
+	missing := sets.New[string]()
+	for cluster := range expectedClusters {
+		if !executionSpaces.Has(names.GenerateExecutionSpaceName(cluster)) {
+			missing.Insert(cluster)
+		}
+	}
+	return missing
 }
 
 // GenerateNodeClaimByPodSpec will return a NodeClaim from PodSpec.

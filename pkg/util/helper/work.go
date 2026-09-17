@@ -24,6 +24,7 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/client"
 
 	workv1alpha1 "github.com/karmada-io/karmada/pkg/apis/work/v1alpha1"
+	workv1alpha2 "github.com/karmada-io/karmada/pkg/apis/work/v1alpha2"
 	"github.com/karmada-io/karmada/pkg/util/indexregistry"
 )
 
@@ -49,4 +50,21 @@ func GetWorksByBindingID(ctx context.Context, c client.Client, bindingID string,
 		FieldSelector: fields.OneTermEqualSelector(key, bindingID),
 	}
 	return workList, c.List(ctx, workList, listOpt)
+}
+
+// GetWorksByBindingIDFromAPIServer gets WorkList by matching same binding's permanent id,
+// reading directly from the API server rather than from an informer cache.
+//
+// GetWorksByBindingID relies on a field index that only exists in the cache, so it cannot
+// be served by an uncached reader. The label the index is built from selects the same set
+// server-side, which is what this function uses.
+func GetWorksByBindingIDFromAPIServer(ctx context.Context, r client.Reader, bindingID string, namespaced bool) (*workv1alpha1.WorkList, error) {
+	var label string
+	if namespaced {
+		label = workv1alpha2.ResourceBindingPermanentIDLabel
+	} else {
+		label = workv1alpha2.ClusterResourceBindingPermanentIDLabel
+	}
+	workList := &workv1alpha1.WorkList{}
+	return workList, r.List(ctx, workList, client.MatchingLabels{label: bindingID})
 }
