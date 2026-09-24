@@ -19,12 +19,17 @@ package helper
 import (
 	"context"
 
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/fields"
 	"k8s.io/apimachinery/pkg/labels"
+	"k8s.io/apimachinery/pkg/util/errors"
+	"k8s.io/apimachinery/pkg/util/sets"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 
 	workv1alpha1 "github.com/karmada-io/karmada/pkg/apis/work/v1alpha1"
+	workv1alpha2 "github.com/karmada-io/karmada/pkg/apis/work/v1alpha2"
 	"github.com/karmada-io/karmada/pkg/util/indexregistry"
+	"github.com/karmada-io/karmada/pkg/util/names"
 )
 
 // GetWorksByLabelsSet gets WorkList by matching labels.Set.
@@ -49,4 +54,33 @@ func GetWorksByBindingID(ctx context.Context, c client.Client, bindingID string,
 		FieldSelector: fields.OneTermEqualSelector(key, bindingID),
 	}
 	return workList, c.List(ctx, workList, listOpt)
+}
+
+// GetBindingWorksInClustersFromAPIServer reads the binding's Work named workName in each
+// cluster's execution namespace directly from the API server, skipping any that is absent
+// or carries another binding's permanent id.
+func GetBindingWorksInClustersFromAPIServer(ctx context.Context, r client.Reader, bindingID string, namespaced bool,
+	workName string, clusters sets.Set[string]) ([]workv1alpha1.Work, error) {
+	label := workv1alpha2.ClusterResourceBindingPermanentIDLabel
+	if namespaced {
+		label = workv1alpha2.ResourceBindingPermanentIDLabel
+	}
+
+	var works []workv1alpha1.Work
+	var errs []error
+	for _, cluster := range sets.List(clusters) {
+		work := &workv1alpha1.Work{}
+		err := r.Get(ctx, client.ObjectKey{Namespace: names.GenerateExecutionSpaceName(cluster), Name: workName}, work)
+		if apierrors.IsNotFound(err) {
+			continue
+		}
+		if err != nil {
+			errs = append(errs, err)
+			continue
+		}
+		if work.Labels[label] == bindingID {
+			works = append(works, *work)
+		}
+	}
+	return works, errors.NewAggregate(errs)
 }
