@@ -36,6 +36,7 @@ import (
 	"k8s.io/klog/v2"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 
+	clusterv1alpha1 "github.com/karmada-io/karmada/pkg/apis/cluster/v1alpha1"
 	policyv1alpha1 "github.com/karmada-io/karmada/pkg/apis/policy/v1alpha1"
 	workv1alpha1 "github.com/karmada-io/karmada/pkg/apis/work/v1alpha1"
 	workv1alpha2 "github.com/karmada-io/karmada/pkg/apis/work/v1alpha2"
@@ -402,11 +403,42 @@ func GetResourceBindingsByNamespace(c client.Client, namespace string) (*workv1a
 }
 
 // DeleteWorks will delete all Work objects by labels.
-func DeleteWorks(ctx context.Context, c client.Client, namespace, name, bindingID string) error {
+func DeleteWorks(ctx context.Context, c client.Client, apiReader client.Reader, namespace, name, bindingID string,
+	resource workv1alpha2.ObjectReference, expectedClusters sets.Set[string]) error {
 	workList, err := GetWorksByBindingID(ctx, c, bindingID, namespace != "")
 	if err != nil {
 		klog.Errorf("Failed to get works by (Cluster)ResourceBinding(%s/%s) : %v", namespace, name, err)
 		return err
+	}
+
+	// The caller removes the finalizer once this returns, and Work carries no
+	// cross-namespace ownerReference, so a Work this misses is stranded for good.
+	// The index behind GetWorksByBindingID trails the API server by a watch
+	// round-trip, so read every cluster the cache does not account for from the
+	// API server by name. With no expected cluster to compare against, every
+	// cluster is a candidate.
+	candidates := expectedClusters
+	if candidates.Len() == 0 {
+		candidates, err = allClusterNames(ctx, c)
+		if err != nil {
+			klog.Errorf("Failed to list clusters to confirm works by (Cluster)ResourceBinding(%s/%s): %v", namespace, name, err)
+			return err
+		}
+	}
+	missing := clustersMissingWorks(workList, candidates)
+	if missing.Len() > 0 {
+		workName := names.GenerateWorkName(resource.Kind, resource.Name, resource.Namespace)
+		confirmed, err := GetBindingWorksInClustersFromAPIServer(ctx, apiReader, bindingID, namespace != "", workName, missing)
+		if err != nil {
+			klog.Errorf("Failed to confirm works by (Cluster)ResourceBinding(%s/%s) against the API server: %v", namespace, name, err)
+			return err
+		}
+		if len(confirmed) > 0 {
+			klog.V(2).InfoS("Cache reported fewer works than the API server for binding, deleting the works the cache missed",
+				"namespace", namespace, "binding", name, "cached", len(workList.Items),
+				"confirmed", len(workList.Items)+len(confirmed), "clustersMissingFromCache", sets.List(missing))
+		}
+		workList.Items = append(workList.Items, confirmed...)
 	}
 
 	var errs []error
@@ -420,6 +452,47 @@ func DeleteWorks(ctx context.Context, c client.Client, namespace, name, bindingI
 		}
 	}
 	return errors.NewAggregate(errs)
+}
+
+func allClusterNames(ctx context.Context, c client.Reader) (sets.Set[string], error) {
+	clusterList := &clusterv1alpha1.ClusterList{}
+	if err := c.List(ctx, clusterList); err != nil {
+		return nil, err
+	}
+	clusters := sets.New[string]()
+	for index := range clusterList.Items {
+		clusters.Insert(clusterList.Items[index].Name)
+	}
+	return clusters, nil
+}
+
+// ClustersThatMayHoldWorks returns every cluster a binding may still have a Work on.
+// That is wider than the binding's scheduling result: a cluster whose eviction task
+// purges directly is excluded from ObtainBindingSpecExistingClusters and keeps its
+// Work until something removes it, and a cluster the binding has since been evicted
+// from still appears in the aggregated status.
+func ClustersThatMayHoldWorks(spec workv1alpha2.ResourceBindingSpec, status workv1alpha2.ResourceBindingStatus) sets.Set[string] {
+	clusters := ObtainBindingSpecExistingClusters(spec).Union(ObtainClustersWithPurgeModeDirectly(spec))
+	for _, item := range status.AggregatedStatus {
+		clusters.Insert(item.ClusterName)
+	}
+	return clusters
+}
+
+// clustersMissingWorks reports the expected clusters that workList holds no Work for.
+func clustersMissingWorks(workList *workv1alpha1.WorkList, expectedClusters sets.Set[string]) sets.Set[string] {
+	executionSpaces := sets.New[string]()
+	for index := range workList.Items {
+		executionSpaces.Insert(workList.Items[index].Namespace)
+	}
+
+	missing := sets.New[string]()
+	for cluster := range expectedClusters {
+		if !executionSpaces.Has(names.GenerateExecutionSpaceName(cluster)) {
+			missing.Insert(cluster)
+		}
+	}
+	return missing
 }
 
 // GenerateNodeClaimByPodSpec will return a NodeClaim from PodSpec.
