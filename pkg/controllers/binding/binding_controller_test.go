@@ -24,6 +24,7 @@ import (
 
 	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
@@ -63,6 +64,7 @@ func makeFakeRBCByResource(rs *workv1alpha2.ObjectReference) (*ResourceBindingCo
 	if rs == nil {
 		return &ResourceBindingController{
 			Client:          c,
+			APIReader:       c,
 			RESTMapper:      testing2.RestMapper,
 			InformerManager: genericmanager.NewSingleClusterInformerManager(context.TODO(), tempDyClient, 0, fedinformer.StripUnusedFields),
 			DynamicClient:   tempDyClient,
@@ -93,6 +95,7 @@ func makeFakeRBCByResource(rs *workv1alpha2.ObjectReference) (*ResourceBindingCo
 
 	return &ResourceBindingController{
 		Client:          c,
+		APIReader:       c,
 		RESTMapper:      helper.NewGroupRESTMapper(rs.Kind, meta.RESTScopeNamespace),
 		InformerManager: testingutil.NewSingleClusterInformerManagerByRS(src, obj),
 		DynamicClient:   tempDyClient,
@@ -255,6 +258,89 @@ func TestResourceBindingController_removeOrphanWorks(t *testing.T) {
 			}
 			if err := c.removeOrphanWorks(context.TODO(), tt.rb); (err != nil) != tt.wantErr {
 				t.Errorf("removeOrphanWorks() error = %v, wantErr %v", err, tt.wantErr)
+			}
+		})
+	}
+}
+
+func TestResourceBindingController_removeOrphanWorks_unscheduledClusters(t *testing.T) {
+	rs := workv1alpha2.ObjectReference{
+		APIVersion: "v1",
+		Kind:       "Pod",
+		Namespace:  "default",
+		Name:       "pod",
+	}
+	bindingID := "3617252f-b1bb-43b0-98a1-c7de833c472c"
+	tests := []struct {
+		name string
+		spec workv1alpha2.ResourceBindingSpec
+		stat workv1alpha2.ResourceBindingStatus
+	}{
+		{
+			name: "cluster the binding is no longer scheduled to but still reports status",
+			spec: workv1alpha2.ResourceBindingSpec{
+				Resource: rs,
+				Clusters: []workv1alpha2.TargetCluster{{Name: "cluster1"}},
+			},
+			stat: workv1alpha2.ResourceBindingStatus{
+				AggregatedStatus: []workv1alpha2.AggregatedStatusItem{{ClusterName: "cluster1"}, {ClusterName: "cluster2"}},
+			},
+		},
+		{
+			name: "cluster evicted with PurgeMode Directly",
+			spec: workv1alpha2.ResourceBindingSpec{
+				Resource: rs,
+				Clusters: []workv1alpha2.TargetCluster{{Name: "cluster1"}},
+				GracefulEvictionTasks: []workv1alpha2.GracefulEvictionTask{
+					{FromCluster: "cluster2", PurgeMode: policyv1alpha1.PurgeModeDirectly},
+				},
+			},
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			c, makeErr := makeFakeRBCByResource(&rs)
+			if makeErr != nil {
+				t.Fatalf("makeFakeRBCByResource %v", makeErr)
+			}
+			for _, cluster := range []string{"cluster1", "cluster2"} {
+				work := &workv1alpha1.Work{
+					ObjectMeta: metav1.ObjectMeta{
+						Name:      "test-work",
+						Namespace: "karmada-es-" + cluster,
+						Labels:    map[string]string{workv1alpha2.ResourceBindingPermanentIDLabel: bindingID},
+					},
+				}
+				if err := c.Client.Create(context.TODO(), work); err != nil {
+					t.Fatalf("create work: %v", err)
+				}
+			}
+			rb := &workv1alpha2.ResourceBinding{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:      "test-rb",
+					Namespace: "default",
+					Labels:    map[string]string{workv1alpha2.ResourceBindingPermanentIDLabel: bindingID},
+				},
+				Spec:   tt.spec,
+				Status: tt.stat,
+			}
+
+			if err := c.removeOrphanWorks(context.TODO(), rb); err != nil {
+				t.Fatalf("removeOrphanWorks() error = %v", err)
+			}
+
+			if err := c.Client.Get(context.TODO(), client.ObjectKey{Namespace: "karmada-es-cluster1", Name: "test-work"}, &workv1alpha1.Work{}); err != nil {
+				t.Errorf("work on scheduled cluster1 was removed: %v", err)
+			}
+			if err := c.Client.Get(context.TODO(), client.ObjectKey{Namespace: "karmada-es-cluster2", Name: "test-work"}, &workv1alpha1.Work{}); !apierrors.IsNotFound(err) {
+				t.Errorf("work on cluster2 survived removeOrphanWorks, err = %v", err)
+			}
+			needWait, err := c.checkDirectPurgeOrphanWorks(context.TODO(), rb)
+			if err != nil {
+				t.Fatalf("checkDirectPurgeOrphanWorks() error = %v", err)
+			}
+			if needWait {
+				t.Errorf("checkDirectPurgeOrphanWorks() = true, syncBinding would requeue indefinitely")
 			}
 		})
 	}

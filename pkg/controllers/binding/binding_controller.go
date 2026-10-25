@@ -55,6 +55,7 @@ const ControllerName = "binding-controller"
 // ResourceBindingController is to sync ResourceBinding.
 type ResourceBindingController struct {
 	client.Client                                                   // used to operate ClusterResourceBinding resources.
+	APIReader           client.Reader                               // used to confirm against the API server that a cache read was not stale.
 	DynamicClient       dynamic.Interface                           // used to fetch arbitrary resources from api server.
 	InformerManager     genericmanager.SingleClusterInformerManager // used to fetch arbitrary resources from cache.
 	EventRecorder       record.EventRecorder
@@ -82,7 +83,7 @@ func (c *ResourceBindingController) Reconcile(ctx context.Context, req controlle
 
 	if !binding.DeletionTimestamp.IsZero() {
 		klog.V(4).InfoS("Begin deleting works owned by ResourceBinding", "binding", req.NamespacedName.String())
-		if err := helper.DeleteWorks(ctx, c.Client, req.Namespace, req.Name, binding.Labels[workv1alpha2.ResourceBindingPermanentIDLabel]); err != nil {
+		if err := helper.DeleteWorks(ctx, c.Client, c.APIReader, req.Namespace, req.Name, binding.Labels[workv1alpha2.ResourceBindingPermanentIDLabel], binding.Spec.Resource, helper.ClustersThatMayHoldWorks(binding.Spec, binding.Status)); err != nil {
 			klog.ErrorS(err, "Failed deleting works owned by ResourceBinding", "namespace", binding.GetNamespace(), "binding", binding.GetName())
 			return controllerruntime.Result{}, err
 		}
